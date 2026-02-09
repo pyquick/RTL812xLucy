@@ -1316,7 +1316,7 @@ void rtl8125_set_reg_oobs_en_sel(struct rtl8125_private *tp, bool enable)
 
 void rtl8125_hw_d3_para(struct rtl8125_private *tp)
 {
-    RTL_W16(tp, RxMaxSize, PAGE_SIZE);
+    RTL_W16(tp, RxMaxSize, tp->rms);
 
     rtl8125_enable_force_clkreq(tp, 0);
     rtl8125_enable_aspm_clkreq_lock(tp, 0);

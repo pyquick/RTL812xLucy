@@ -181,7 +181,6 @@ bool RTL8125::init(OSDictionary *properties)
         netStats = NULL;
         etherStats = NULL;
         baseMap = NULL;
-        rxBufferSize = kRxBufferSize;
         rxPool = NULL;
         txMbufCursor = NULL;
         rxBufArrayMem = NULL;
@@ -189,7 +188,10 @@ bool RTL8125::init(OSDictionary *properties)
         statBufDesc = NULL;
         statPhyAddr = (IOPhysicalAddress64)NULL;
         statData = NULL;
-        
+        rxPacketHead = NULL;
+        rxPacketTail = NULL;
+        rxPacketSize = 0;
+
 #ifdef ENABLE_USE_FIRMWARE_FILE
         fwMem = NULL;
 #endif  /* ENABLE_USE_FIRMWARE_FILE */
@@ -209,7 +211,6 @@ bool RTL8125::init(OSDictionary *properties)
         timerValue = 0;
         enableTSO4 = false;
         enableTSO6 = false;
-        enableCSO6 = false;
         wolCapable = false;
         enableGigaLite = false;
         pciPMCtrlOffset = 0;
@@ -536,6 +537,8 @@ IOReturn RTL8125::enable(IONetworkInterface *netif)
     /* We have to enable the interrupt because we are using a msi interrupt. */
     interruptSource->enable();
 
+    rxPacketHead = rxPacketTail = NULL;
+    rxPacketSize = 0;
     txDescDoneCount = txDescDoneLast = 0;
     deadlockWarn = 0;
     set_bit(__ENABLED, &stateFlags);
@@ -600,7 +603,7 @@ IOReturn RTL8125::outputStart(IONetworkInterface *interface, IOOptionBits option
 {
     IOPhysicalSegment txSegments[kMaxSegs];
     mbuf_t m;
-    RtlTxDesc *desc, *firstDesc;
+    RtlTxDesc *desc;
     UInt64 pktBytes;
     IOReturn result = kIOReturnNoResources;
     UInt32 cmd;
@@ -704,7 +707,6 @@ IOReturn RTL8125::outputStart(IONetworkInterface *interface, IOOptionBits option
         index = txNextDescIndex;
         txNextDescIndex = (txNextDescIndex + numSegs) & kTxDescMask;
         txTailPtr0 += numSegs;
-        firstDesc = &txDescArray[index];
         lastSeg = numSegs - 1;
         
         /* Next fill in the VLAN tag. */
@@ -713,8 +715,12 @@ IOReturn RTL8125::outputStart(IONetworkInterface *interface, IOOptionBits option
         /* And finally fill in the descriptors. */
         for (i = 0; i < numSegs; i++) {
             desc = &txDescArray[index];
-            opts1 = (((UInt32)txSegments[i].length) | cmd);
-            opts1 |= (i == 0) ? FirstFrag : DescOwn;
+            opts1 = (((UInt32)txSegments[i].length) | cmd | DescOwn);
+            
+            if (i == 0)
+                opts1 |= FirstFrag;
+
+            //opts1 |= (i == 0) ? (FirstFrag | DescOwn) : DescOwn;
             
             if (i == lastSeg) {
                 opts1 |= LastFrag;
@@ -736,8 +742,8 @@ IOReturn RTL8125::outputStart(IONetworkInterface *interface, IOOptionBits option
             //DebugLog("opts1=0x%x, opts2=0x%x, addr=0x%llx, len=0x%llx\n", opts1, opts2, txSegments[i].location, txSegments[i].length);
             ++index &= kTxDescMask;
         }
-        firstDesc->opts1 |= DescOwn;
     }
+    wmb();
     /* Update tail pointer. */
     rtl812xDoorbell(&linuxData, txTailPtr0);
     
@@ -823,7 +829,7 @@ bool RTL8125::configureInterface(IONetworkInterface *interface)
             goto done;
         }
     }
-    error = interface->configureOutputPullModel((kNumTxDesc/2), 0, 0, IONetworkInterface::kOutputPacketSchedulingModelNormal);
+    error = interface->configureOutputPullModel(kNumTxDesc, 0, 0, IONetworkInterface::kOutputPacketSchedulingModelNormal);
     
     if (error != kIOReturnSuccess) {
         IOLog("configureOutputPullModel() failed\n.");
@@ -965,7 +971,7 @@ IOReturn RTL8125::getChecksumSupport(UInt32 *checksumMask, UInt32 checksumFamily
 
     if ((checksumFamily == kChecksumFamilyTCPIP) && checksumMask) {
         if (isOutput) {
-            *checksumMask = (enableCSO6) ? (kChecksumTCP | kChecksumUDP | kChecksumIP | kChecksumTCPIPv6 | kChecksumUDPIPv6) : (kChecksumTCP | kChecksumUDP | kChecksumIP);
+            *checksumMask = (kChecksumTCP | kChecksumUDP | kChecksumIP | kChecksumTCPIPv6 | kChecksumUDPIPv6);
         } else {
             *checksumMask = (kChecksumTCP | kChecksumUDP | kChecksumIP | kChecksumTCPIPv6 | kChecksumUDPIPv6);
         }
@@ -1092,25 +1098,7 @@ IOReturn RTL8125::getMaxPacketSize(UInt32 * maxSize) const
 {
     DebugLog("getMaxPacketSize() ===>\n");
         
-    if (version_major >= 22) {
-        /*
-         * Starting with Ventura we can be honest about jumbo
-         * frame support.
-         */
-        *maxSize = rxBufferSize - 2;
-    } else {
-        /*
-         * In case we reported a maximum packet size below 9018
-         * the network preferences panel wouldn't allow the user
-         * to set an MTU above 1500 which would disable jumbo
-         * frame support completely. Therefore we fake a maximum
-         * packet size of 9018 although trying to set anything
-         * above 4094 in setMaxPacketSize() will fail. This is
-         * ugly but the only solution.
-         */
-        *maxSize = kMaxPacketSize;
-    }
-    DebugLog("maxSize: %u, version_major: %u\n", *maxSize, version_major);
+    *maxSize = kMaxPacketSize;
 
     DebugLog("getMaxPacketSize() <===\n");
     
@@ -1127,18 +1115,18 @@ IOReturn RTL8125::setMaxPacketSize(UInt32 maxSize)
 
     DebugLog("setMaxPacketSize() ===>\n");
     
-    if (maxSize <= (rxBufferSize - 2)) {
-        mtu = maxSize - (ETH_HLEN + ETH_FCS_LEN);
+    if (maxSize <= kMaxPacketSize) {
+        mtu = maxSize - (VLAN_ETH_HLEN + ETH_FCS_LEN);
         DebugLog("maxSize: %u, mtu: %u\n", maxSize, mtu);
+        
+        /* Adjust maximum rx size. */
+        tp->rms = mtu + VLAN_ETH_HLEN + ETH_FCS_LEN;
         
         if (enableTSO4)
             mask |= IFNET_TSO_IPV4;
         
         if (enableTSO6)
             mask |= IFNET_TSO_IPV6;
-
-        if (enableCSO6)
-            mask |= (IFNET_CSUM_TCPIPV6 | IFNET_CSUM_UDPIPV6);
 
         offload = ifnet_offload(ifnet);
         
@@ -1149,6 +1137,7 @@ IOReturn RTL8125::setMaxPacketSize(UInt32 maxSize)
             offload |= mask;
             DebugLog("Enable hardware offload features: %x!\n", mask);
         }
+        
         if (ifnet_set_offload(ifnet, offload))
             IOLog("Error setting hardware offload: %x!\n", offload);
         /* Force reinitialization. */
@@ -1236,7 +1225,7 @@ UInt32 RTL8125::rxInterrupt(IONetworkInterface *interface, uint32_t maxCount, IO
     UInt64 addr;
     UInt64 word1;
     UInt32 descStatus1, descStatus2;
-    UInt32 pktSize;
+    SInt32 pktSize;
     UInt32 goodPkts = 0;
     bool replaced;
     
@@ -1244,13 +1233,6 @@ UInt32 RTL8125::rxInterrupt(IONetworkInterface *interface, uint32_t maxCount, IO
         word1 = (rxNextDescIndex == kRxLastDesc) ? (kRxBufferSize | DescOwn | RingEnd) : (kRxBufferSize | DescOwn);
         addr = rxBufArray[rxNextDescIndex].phyAddr;
 
-        /* As we don't support fragmented packets we treat them as errors. */
-        if (unlikely((descStatus1 & (FirstFrag|LastFrag)) != (FirstFrag|LastFrag))) {
-            DebugLog("Fragmented packet.\n");
-            etherStats->dot3StatsEntry.frameTooLongs++;
-            goto nextDesc;
-        }
-        
         /* Drop packets with receive errors. */
         if (unlikely(descStatus1 & RxRES)) {
             DebugLog("Rx error.\n");
@@ -1261,11 +1243,12 @@ UInt32 RTL8125::rxInterrupt(IONetworkInterface *interface, uint32_t maxCount, IO
             if (descStatus1 & RxCRC)
                 etherStats->dot3StatsEntry.fcsErrors++;
 
+            discardPacketFragment();
             goto nextDesc;
         }
         
         descStatus2 = OSSwapLittleToHostInt32(desc->cmd.opts2);
-        pktSize = (descStatus1 & 0x1fff) - kIOEthernetCRCSize;
+        pktSize = (descStatus1 & 0x1fff);
         bufPkt = rxBufArray[rxNextDescIndex].mbuf;
         //DebugLog("rxInterrupt(): descStatus1=0x%x, descStatus2=0x%x, pktSize=%u\n", descStatus1, descStatus2, pktSize);
         
@@ -1278,14 +1261,16 @@ UInt32 RTL8125::rxInterrupt(IONetworkInterface *interface, uint32_t maxCount, IO
              */
             DebugLog("replaceOrCopyPacket() failed.\n");
             etherStats->dot3RxExtraEntry.resourceErrors++;
+            discardPacketFragment();
             goto nextDesc;
         }
 handle_pkt:
         /* If the packet was replaced we have to update the descriptor's buffer address. */
         if (replaced) {
-            if (mbuf_next(bufPkt) != NULL) {
-                DebugLog("getPhysicalSegments() failed.\n");
+            if (unlikely(mbuf_next(bufPkt) != NULL)) {
+                DebugLog("getPhysicalSegment() failed.\n");
                 etherStats->dot3RxExtraEntry.resourceErrors++;
+                discardPacketFragment();
                 mbuf_freem_list(bufPkt);
                 goto nextDesc;
             }
@@ -1293,19 +1278,69 @@ handle_pkt:
             addr = mbuf_data_to_physical(mbuf_datastart(bufPkt));
             rxBufArray[rxNextDescIndex].phyAddr = addr;
         }
-        /* Set the length of the buffer. */
-        mbuf_setlen(newPkt, pktSize);
+        if (descStatus1 & LastFrag) {
+            pktSize -= kIOEthernetCRCSize;
+            
+            if (rxPacketHead) {
+                if (pktSize > 0) {
+                    /* This is the last buffer of a jumbo frame. */
+                    mbuf_setlen(newPkt, pktSize);
 
-        getChecksumResult(newPkt, descStatus1, descStatus2);
+                    mbuf_setflags_mask(newPkt, 0, MBUF_PKTHDR);
+                    mbuf_setnext(rxPacketTail, newPkt);
+                    
+                    rxPacketTail = newPkt;
+                } else {
+                    /*
+                     * The last fragment consists only of the FCS or a part
+                     * of it, so that we can drop it and adjust the packet
+                     * length to exclude the FCS.
+                     */
+                    DebugLog("Packet size: %d. Dropping!\n", pktSize);
+                    mbuf_free(newPkt);
+                    mbuf_adjustlen(rxPacketTail, pktSize);
+                }
+                rxPacketSize += pktSize;
+            } else {
+                /*
+                 * We've got a complete packet in one buffer.
+                 * It can be enqueued directly.
+                 */
+                mbuf_setlen(newPkt, pktSize);
 
-        /* Also get the VLAN tag if there is any. */
-        if (descStatus2 & RxVlanTag)
-            setVlanTag(newPkt, OSSwapInt16(descStatus2 & 0xffff));
+                rxPacketHead = newPkt;
+                rxPacketSize = pktSize;
+            }
+            getChecksumResult(newPkt, descStatus1, descStatus2);
+            
+            /* Also get the VLAN tag if there is any. */
+            if (descStatus2 & RxVlanTag)
+                setVlanTag(rxPacketHead, OSSwapInt16(descStatus2 & 0xffff));
+            
+            mbuf_pkthdr_setlen(rxPacketHead, rxPacketSize);
+            interface->enqueueInputPacket(rxPacketHead, pollQueue);
+            
+            rxPacketHead = rxPacketTail = NULL;
+            rxPacketSize = 0;
+            
+            goodPkts++;
+        } else {
+            mbuf_setlen(newPkt, pktSize);
 
-        mbuf_pkthdr_setlen(newPkt, pktSize);
-        interface->enqueueInputPacket(newPkt, pollQueue);
-        goodPkts++;
-        
+            if (rxPacketHead) {
+                /* We are in the middle of a jumbo frame. */
+                mbuf_setflags_mask(newPkt, 0, MBUF_PKTHDR);
+                mbuf_setnext(rxPacketTail, newPkt);
+                
+                rxPacketTail = newPkt;
+                rxPacketSize += pktSize;
+            } else {
+                /* This is the first buffer of a jumbo frame. */
+                rxPacketHead = rxPacketTail = newPkt;
+                rxPacketSize = pktSize;
+            }
+        }
+
         /* Finally update the descriptor and get the next one to examine. */
     nextDesc:
         desc->buf.addr = OSSwapHostToLittleInt64(addr);

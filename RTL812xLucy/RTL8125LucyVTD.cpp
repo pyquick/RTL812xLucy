@@ -445,17 +445,11 @@ UInt32 RTL8125::rxInterruptVTD(IONetworkInterface *interface, uint32_t maxCount,
     UInt32 goodPkts = 0;
     UInt32 numMap = 0;
     UInt32 descStatus1, descStatus2;
-    UInt32 pktSize;
+    SInt32 pktSize;
     bool replaced;
     
     while (!((descStatus1 = OSSwapLittleToHostInt32(desc->cmd.opts1)) & DescOwn) && (goodPkts < maxCount)) {
-        /* As we don't support fragmented packets we treat them as errors. */
-        if (unlikely((descStatus1 & (FirstFrag|LastFrag)) != (FirstFrag|LastFrag))) {
-            DebugLog("Fragmented packet.\n");
-            etherStats->dot3StatsEntry.frameTooLongs++;
-            goto nextDesc;
-        }
-        
+
         /* Drop packets with receive errors. */
         if (unlikely(descStatus1 & RxRES)) {
             DebugLog("Rx error.\n");
@@ -466,11 +460,12 @@ UInt32 RTL8125::rxInterruptVTD(IONetworkInterface *interface, uint32_t maxCount,
             if (descStatus1 & RxCRC)
                 etherStats->dot3StatsEntry.fcsErrors++;
 
+            discardPacketFragment();
             goto nextDesc;
         }
         
         descStatus2 = OSSwapLittleToHostInt32(desc->cmd.opts2);
-        pktSize = (descStatus1 & 0x1fff) - kIOEthernetCRCSize;
+        pktSize = (descStatus1 & 0x1fff);
         bufPkt = rxBufArray[rxNextDescIndex].mbuf;
         //DebugLog("rxInterrupt(): descStatus1=0x%x, descStatus2=0x%x, pktSize=%u\n", descStatus1, descStatus2, pktSize);
         
@@ -482,35 +477,86 @@ UInt32 RTL8125::rxInterruptVTD(IONetworkInterface *interface, uint32_t maxCount,
              * original packet in place.
              */
             DebugLog("replaceOrCopyPacket() failed.\n");
+            discardPacketFragment();
             etherStats->dot3RxExtraEntry.resourceErrors++;
             goto nextDesc;
         }
 handle_pkt:
         /* If the packet was replaced we have to update the descriptor's buffer address. */
         if (replaced) {
-            if (mbuf_next(bufPkt) != NULL) {
-                DebugLog("getPhysicalSegments() failed.\n");
+            if (unlikely(mbuf_next(bufPkt) != NULL)) {
+                DebugLog("getPhysicalSegment() failed.\n");
                 etherStats->dot3RxExtraEntry.resourceErrors++;
+                discardPacketFragment();
                 mbuf_freem_list(bufPkt);
                 goto nextDesc;
             }
             rxBufArray[rxNextDescIndex].mbuf = bufPkt;
             rxBufArray[rxNextDescIndex].phyAddr = 0;
         }
-        /* Set the length of the buffer. */
-        mbuf_setlen(newPkt, pktSize);
+        if (descStatus1 & LastFrag) {
+            pktSize -= kIOEthernetCRCSize;
+            
+            if (rxPacketHead) {
+                if (pktSize > 0) {
+                    /* This is the last buffer of a jumbo frame. */
+                    mbuf_setlen(newPkt, pktSize);
 
-        getChecksumResult(newPkt, descStatus1, descStatus2);
+                    mbuf_setflags_mask(newPkt, 0, MBUF_PKTHDR);
+                    mbuf_setnext(rxPacketTail, newPkt);
+                    
+                    rxPacketTail = newPkt;
+                } else {
+                    /*
+                     * The last fragment consists only of the FCS or a part
+                     * of it, so that we can drop it and adjust the packet
+                     * length to exclude the FCS.
+                     */
+                    DebugLog("Packet size: %d. Dropping!\n", pktSize);
+                    mbuf_free(newPkt);
+                    mbuf_adjustlen(rxPacketTail, pktSize);
+                }
+                rxPacketSize += pktSize;
+            } else {
+                /*
+                 * We've got a complete packet in one buffer.
+                 * It can be enqueued directly.
+                 */
+                mbuf_setlen(newPkt, pktSize);
 
-        /* Also get the VLAN tag if there is any. */
-        if (descStatus2 & RxVlanTag)
-            setVlanTag(newPkt, OSSwapInt16(descStatus2 & 0xffff));
+                rxPacketHead = newPkt;
+                rxPacketSize = pktSize;
+            }
+            getChecksumResult(newPkt, descStatus1, descStatus2);
+            
+            /* Also get the VLAN tag if there is any. */
+            if (descStatus2 & RxVlanTag)
+                setVlanTag(rxPacketHead, OSSwapInt16(descStatus2 & 0xffff));
+            
+            mbuf_pkthdr_setlen(rxPacketHead, rxPacketSize);
+            interface->enqueueInputPacket(rxPacketHead, pollQueue);
+            
+            rxPacketHead = rxPacketTail = NULL;
+            rxPacketSize = 0;
+            
+            goodPkts++;
+        } else {
+            mbuf_setlen(newPkt, pktSize);
 
-        mbuf_pkthdr_setlen(newPkt, pktSize);
-        interface->enqueueInputPacket(newPkt, pollQueue);
-        goodPkts++;
+            if (rxPacketHead) {
+                /* We are in the middle of a jumbo frame. */
+                mbuf_setflags_mask(newPkt, 0, MBUF_PKTHDR);
+                mbuf_setnext(rxPacketTail, newPkt);
+                
+                rxPacketTail = newPkt;
+                rxPacketSize += pktSize;
+            } else {
+                /* This is the first buffer of a jumbo frame. */
+                rxPacketHead = rxPacketTail = newPkt;
+                rxPacketSize = pktSize;
+            }
+        }
         
-        /* Finally update the descriptor and get the next one to examine. */
     nextDesc:
         /*
          * If a batch has been completed, increment the number of

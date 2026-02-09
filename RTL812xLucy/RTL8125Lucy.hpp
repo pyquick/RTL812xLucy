@@ -192,7 +192,7 @@ typedef struct RtlStatData {
 #define kMaxSegs 32
 
 /* The number of descriptors must be a power of 2. */
-#define kNumTxDesc    512    /* Number of Tx descriptors */
+#define kNumTxDesc    1024   /* Number of Tx descriptors */
 #define kNumRxDesc    512    /* Number of Rx descriptors */
 #define kTxLastDesc    (kNumTxDesc - 1)
 #define kRxLastDesc    (kNumRxDesc - 1)
@@ -225,7 +225,7 @@ typedef struct RtlStatData {
 /* This is the receive buffer size (must be large enough to hold a packet). */
 #define kMCFilterLimit  32
 #define kMaxMtu 9000
-#define kMaxPacketSize (kMaxMtu + ETH_HLEN + ETH_FCS_LEN)
+#define kMaxPacketSize (kMaxMtu + ETH_HLEN + VLAN_HLEN + ETH_FCS_LEN)
 
 /* statitics timer period in ms. */
 #define kTimeoutMS 1000
@@ -300,6 +300,8 @@ enum
 #define kFallbackName "fallbackMAC"
 #define kNameLenght 64
 
+#define kChipsetName "Chipset"
+#define kUnknownRevisionName "ChipRevUnknown"
 /*
  * Indicates if a tx IOMemoryDescriptor is in the prepared
  * (active) or completed state (inactive).
@@ -445,6 +447,7 @@ private:
     void freeStatResources();
 
     void clearRxTxRings();
+    void discardPacketFragment();
     void updateStatitics();
     void setLinkUp();
     void setLinkDown();
@@ -548,7 +551,9 @@ private:
     void *rxMapMem;
     rtlRxMapInfo *rxMapInfo;
     UInt64 multicastFilter;
-    UInt32 rxBufferSize;
+    mbuf_t rxPacketHead;
+    mbuf_t rxPacketTail;
+    SInt32 rxPacketSize;
     UInt16 rxNextDescIndex;
     UInt16 rxMapNextIndex;
 
@@ -597,7 +602,6 @@ private:
     bool enableASPM;
     bool enableTSO4;
     bool enableTSO6;
-    bool enableCSO6;
     bool useAppleVTD;
     bool wolCapable;
     bool enableGigaLite;

@@ -440,7 +440,6 @@ bool RTL8125::setupTxResources()
     IODMACommand::Segment64 seg;
     UInt64 offset = 0;
     UInt32 numSegs = 1;
-    UInt32 i;
     bool result = false;
     
     /* Alloc tx mbuf_t array. */
@@ -734,6 +733,21 @@ void RTL8125::clearRxTxRings()
     rxMapNextIndex = 0;
     deadlockWarn = 0;
 
+    /* Free packet fragments which haven't been upstreamed yet.  */
+    discardPacketFragment();
+
     DebugLog("clearRxTxRings() <===\n");
 }
 
+void RTL8125::discardPacketFragment()
+{
+    /*
+     * In case there is a packet fragment which hasn't been enqueued yet
+     * we have to free it in order to prevent a memory leak.
+     */
+    if (rxPacketHead)
+        mbuf_freem_list(rxPacketHead);
+    
+    rxPacketHead = rxPacketTail = NULL;
+    rxPacketSize = 0;
+}

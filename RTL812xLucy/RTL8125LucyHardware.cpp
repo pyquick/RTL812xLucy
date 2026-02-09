@@ -207,6 +207,7 @@ bool RTL8125::rtl812xIdentifyChip(struct rtl8125_private *tp)
     reg = val32 & 0x7c800000;
     ICVerID = val32 & 0x00700000;
 
+    tp->chipset = 0xffffffff;
     tp->HwIcVerUnknown = false;
 
     switch (reg) {
@@ -306,7 +307,9 @@ bool RTL8125::rtl812xIdentifyChip(struct rtl8125_private *tp)
             tp->chipset = 11;
         }
     }
-
+    this->setProperty(kChipsetName, tp->chipset, 32);
+    this->setProperty(kUnknownRevisionName, tp->HwIcVerUnknown);
+    
     tp->rtl8125_rx_config = rtlChipInfos[tp->chipset].RCR_Cfg;
 
 #ifdef ENABLE_USE_FIRMWARE_FILE
@@ -1154,6 +1157,9 @@ void RTL8125::setLinkUp()
             duplexName = duplexHalfName;
         }
     }
+    rxPacketHead = rxPacketTail = NULL;
+    rxPacketSize = 0;
+
     /* Start hardware. */
     RTL_W8(tp, ChipCmd, CmdTxEnb | CmdRxEnb);
 
